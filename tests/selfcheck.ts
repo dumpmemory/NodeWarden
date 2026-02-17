@@ -140,6 +140,11 @@ let testAttachmentId   = '';  // 测试附件 ID
 let downloadToken      = '';  // 附件下载令牌
 let isNewRegistration  = false;
 
+// Track ALL test-created cipher and folder IDs so cleanup can permanently delete them.
+// This prevents leftover undecryptable "[error: cannot decrypt]" items in the vault.
+const allCreatedCipherIds: string[] = [];
+const allCreatedFolderIds: string[] = [];
+
 const results: TestResult[] = [];
 
 // ─── HTTP 请求辅助 ─────────────────────────────────────────────────────────
@@ -957,6 +962,7 @@ async function suiteCiphers() {
     const missing = hasKeys(body, CIPHER_KEYS);
     if (missing.length) return { ok: false, detail: `缺少: ${missing.join(', ')}` };
     testCipherId = body.id;
+    allCreatedCipherIds.push(body.id);
     return { ok: body.object === 'cipher' && body.type === 1, detail: `id=${testCipherId}` };
   });
 
@@ -966,6 +972,7 @@ async function suiteCiphers() {
     });
     if (status !== 200) return { ok: false, detail: `状态码=${status}` };
     testCipher2Id = body.id;
+    allCreatedCipherIds.push(body.id);
     return { ok: body.type === 2, detail: `id=${testCipher2Id}` };
   });
 
@@ -978,6 +985,7 @@ async function suiteCiphers() {
                 expMonth: '2.01==', expYear: '2.2030==', code: '2.123==' },
       },
     });
+    if (body?.id) allCreatedCipherIds.push(body.id);
     return { ok: status === 200 && body?.type === 3 };
   });
 
@@ -989,6 +997,7 @@ async function suiteCiphers() {
         identity: { firstName: '2.名==', lastName: '2.姓==', email: '2.邮箱==' },
       },
     });
+    if (body?.id) allCreatedCipherIds.push(body.id);
     return { ok: status === 200 && body?.type === 4 };
   });
 
@@ -998,6 +1007,7 @@ async function suiteCiphers() {
       method: 'POST',
       body: { cipher: { type: 2, name: '2.嵌套创建==', secureNote: { type: 0 }, reprompt: 0 } },
     });
+    if (body?.id) allCreatedCipherIds.push(body.id);
     return { ok: status === 200 && body?.object === 'cipher' };
   });
 
@@ -1151,7 +1161,7 @@ async function suiteCiphers() {
   });
 
   await test('POST /api/ciphers/import 批量导入', async () => {
-    const { status } = await api('/api/ciphers/import', {
+    const { status, body } = await api('/api/ciphers/import', {
       method: 'POST',
       body: {
         ciphers: [{ type: 1, name: '2.导入项==', login: { username: '2.u==', password: '2.p==' }, reprompt: 0 }],
@@ -1159,6 +1169,9 @@ async function suiteCiphers() {
         folderRelationships: [{ key: 0, value: 0 }],
       },
     });
+    // Track imported ciphers/folders for cleanup
+    if (body?.ciphers) for (const c of body.ciphers) { if (c?.id) allCreatedCipherIds.push(c.id); }
+    if (body?.folders) for (const f of body.folders) { if (f?.id) allCreatedFolderIds.push(f.id); }
     return { ok: status === 200, detail: `状态码=${status}` };
   });
 }
@@ -1492,6 +1505,48 @@ async function suiteCleanup() {
 
   if (!accessToken) { skip('清理', '未获取到访问令牌'); return; }
 
+  // Permanently delete ALL test-created ciphers to avoid "[error: cannot decrypt]" leftovers.
+  // Collect any remaining ciphers from a sync in case some IDs were not tracked (e.g. import).
+  try {
+    const { body } = await api('/api/sync');
+    if (body?.ciphers) {
+      for (const c of body.ciphers) {
+        if (c?.id && !allCreatedCipherIds.includes(c.id)) {
+          // Check if this cipher has a fake encrypted name (our test marker)
+          const n = c.name || '';
+          if (n.startsWith('2.') && (n.endsWith('==') || n.endsWith('='))) {
+            allCreatedCipherIds.push(c.id);
+          }
+        }
+      }
+      // Also find orphan test folders from import
+      for (const f of (body.folders || [])) {
+        if (f?.id && f.id !== testFolderId && !allCreatedFolderIds.includes(f.id)) {
+          const n = f.name || '';
+          if (n.startsWith('2.') && (n.endsWith('==') || n.endsWith('='))) {
+            allCreatedFolderIds.push(f.id);
+          }
+        }
+      }
+    }
+  } catch { /* best effort */ }
+
+  // Delete all tracked ciphers
+  const cipherIds = [...new Set(allCreatedCipherIds)];
+  if (cipherIds.length > 0) {
+    await test(`永久删除所有测试密码项 (${cipherIds.length} 个)`, async () => {
+      let deleted = 0;
+      for (const id of cipherIds) {
+        // Soft-delete first (required for permanent delete if not already soft-deleted)
+        await api(`/api/ciphers/${id}`, { method: 'DELETE' }).catch(() => {});
+        const { status } = await api(`/api/ciphers/${id}/delete`, { method: 'DELETE' });
+        if (status === 204 || status === 200) deleted++;
+      }
+      return { ok: deleted > 0, detail: `已删除 ${deleted}/${cipherIds.length}` };
+    });
+  }
+
+  // Delete test folder
   if (testFolderId) {
     await test('DELETE /api/folders/:id 删除测试文件夹', async () => {
       const { status } = await api(`/api/folders/${testFolderId}`, { method: 'DELETE' });
@@ -1501,6 +1556,19 @@ async function suiteCleanup() {
     await test('文件夹删除后 → 404', async () => {
       const { status } = await api(`/api/folders/${testFolderId}`);
       return { ok: status === 404 };
+    });
+  }
+
+  // Delete any extra test folders (from import etc.)
+  const extraFolderIds = [...new Set(allCreatedFolderIds)];
+  if (extraFolderIds.length > 0) {
+    await test(`删除导入的测试文件夹 (${extraFolderIds.length} 个)`, async () => {
+      let deleted = 0;
+      for (const id of extraFolderIds) {
+        const { status } = await api(`/api/folders/${id}`, { method: 'DELETE' });
+        if (status === 204 || status === 200) deleted++;
+      }
+      return { ok: true, detail: `已删除 ${deleted}/${extraFolderIds.length}` };
     });
   }
 
